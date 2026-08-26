@@ -124,6 +124,19 @@ def spectrum(audio: np.ndarray, rate: int):
     return frequencies, magnitude_db
 
 
+def active_window_start(audio: np.ndarray, window_samples: int) -> int:
+    """Find a high-energy region so the waveform plot is informative."""
+    if len(audio) <= window_samples:
+        return 0
+
+    block_count = len(audio) // window_samples
+    blocks = audio[: block_count * window_samples].reshape(
+        block_count, window_samples
+    )
+    energies = np.mean(blocks**2, axis=1)
+    return int(np.argmax(energies) * window_samples)
+
+
 def interpretation(snr: float, correlation_value: float) -> str:
     if snr >= 60 and correlation_value >= 0.999:
         return "Excellent: the in-band reconstruction is extremely close to the original."
@@ -168,9 +181,15 @@ info_2.metric("Duration", f"{duration:.2f} s")
 info_3.metric("Channels", channels)
 info_4.metric("Samples/channel", f"{len(original):,}")
 
+with st.expander("Original WAV details"):
+    st.write(f"File name: **{uploaded_file.name}**")
+    st.write(f"Original data type: **{original_pcm.dtype}**")
+    st.write(f"Normalized minimum: **{np.min(original):.6f}**")
+    st.write(f"Normalized maximum: **{np.max(original):.6f}**")
+
 st.subheader("3. Enter the required output rate")
-preset_rates = [8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000]
-default_rate = 16000 if input_rate != 16000 else 48000
+preset_rates = [8000, 16000, 20000, 22050, 24000, 32000, 44100, 48000, 96000]
+default_rate = 20000 if input_rate != 20000 else 16000
 
 output_rate = int(
     st.number_input(
@@ -211,10 +230,14 @@ if st.button(
         converted_pcm = float_to_int16(converted)
         converted_bytes = make_wav(converted, output_rate)
 
+        # Read the actual generated WAV bytes so evaluation includes PCM quantization.
+        saved_rate, saved_pcm = wavfile.read(io.BytesIO(converted_bytes))
+        saved_float = pcm_to_float(saved_pcm)
+
         # A fair error comparison requires both signals at the same sampling rate.
         # Resample the output back to the input rate, then align it with the original.
         reconstructed = resample_poly(
-            pcm_to_float(converted_pcm),
+            saved_float,
             up=down_factor,
             down=up_factor,
             axis=0,
@@ -253,6 +276,11 @@ if st.button(
     more_3.metric("Processing time", f"{processing_time * 1000:.1f} ms")
     more_4.metric("Output samples/channel", f"{len(converted):,}")
 
+    detail_1, detail_2, detail_3 = st.columns(3)
+    detail_1.metric("Compared samples", f"{len(metrics['reference']):,}")
+    detail_2.metric("Output duration", f"{len(converted) / output_rate:.6f} s")
+    detail_3.metric("Output size", f"{len(converted_bytes) / 1024:.2f} KiB")
+
     st.info(interpretation(metrics["snr"], metrics["correlation"]))
     st.caption(
         "SNR, MSE, RMSE, and correlation use a round-trip comparison: the converted "
@@ -261,25 +289,56 @@ if st.button(
         "removed by the anti-alias filter; that expected bandwidth loss contributes to the error."
     )
 
-    st.subheader("Waveform comparison")
-    view_samples = min(len(metrics["reference"]), max(1, int(input_rate * 0.05)))
-    time_axis = np.arange(view_samples) / input_rate * 1000
-    waveform_figure, waveform_axis = plt.subplots(figsize=(11, 4))
-    waveform_axis.plot(time_axis, metrics["reference"][:view_samples], label="Original", linewidth=1.3)
-    waveform_axis.plot(time_axis, metrics["reconstructed"][:view_samples], label="Round-trip reconstructed", linewidth=1, alpha=0.8)
-    waveform_axis.set_xlabel("Time (ms)")
-    waveform_axis.set_ylabel("Normalized amplitude")
-    waveform_axis.set_title("First 50 ms after alignment")
-    waveform_axis.grid(alpha=0.2)
-    waveform_axis.legend()
+    st.subheader("Waveform and reconstruction-error comparison")
+    window_samples = max(1, int(input_rate * 0.05))
+    start = active_window_start(metrics["reference"], window_samples)
+    end = min(start + window_samples, len(metrics["reference"]))
+    time_axis = np.arange(end - start) / input_rate * 1000
+
+    waveform_figure, waveform_axes = plt.subplots(
+        2, 1, figsize=(12, 7), sharex=True
+    )
+    waveform_axes[0].plot(
+        time_axis,
+        metrics["reference"][start:end],
+        label="Original",
+        linewidth=1.3,
+    )
+    waveform_axes[0].plot(
+        time_axis,
+        metrics["reconstructed"][start:end],
+        label="Round-trip reconstructed",
+        linewidth=1,
+        alpha=0.8,
+    )
+    waveform_axes[0].set_ylabel("Normalized amplitude")
+    waveform_axes[0].set_title("Original and round-trip reconstructed waveforms")
+    waveform_axes[0].grid(alpha=0.2)
+    waveform_axes[0].legend()
+
+    waveform_axes[1].plot(
+        time_axis,
+        metrics["error"][start:end],
+        color="crimson",
+        linewidth=1,
+    )
+    waveform_axes[1].set_xlabel("Time within selected 50 ms window (ms)")
+    waveform_axes[1].set_ylabel("Error amplitude")
+    waveform_axes[1].set_title("Reconstruction error")
+    waveform_axes[1].grid(alpha=0.2)
     waveform_figure.tight_layout()
     st.pyplot(waveform_figure)
     plt.close(waveform_figure)
 
+    st.caption(
+        f"Automatically selected active interval: "
+        f"{start / input_rate:.3f} to {end / input_rate:.3f} seconds."
+    )
+
     st.subheader("Frequency-spectrum comparison")
     original_frequency, original_db = spectrum(analysis_channel(original), int(input_rate))
-    converted_frequency, converted_db = spectrum(analysis_channel(converted), output_rate)
-    spectrum_figure, spectrum_axis = plt.subplots(figsize=(11, 4))
+    converted_frequency, converted_db = spectrum(analysis_channel(saved_float), saved_rate)
+    spectrum_figure, spectrum_axis = plt.subplots(figsize=(12, 5))
     spectrum_axis.plot(original_frequency, original_db, label=f"Original ({input_rate:,} Hz)", linewidth=1.2)
     spectrum_axis.plot(converted_frequency, converted_db, label=f"Converted ({output_rate:,} Hz)", linewidth=1.2)
     spectrum_axis.axvline(output_rate / 2, color="crimson", linestyle="--", linewidth=1, label="Output Nyquist limit")
@@ -295,9 +354,15 @@ if st.button(
     plt.close(spectrum_figure)
 
     with st.expander("Conversion details"):
+        st.write(f"Input file: **{uploaded_file.name}**")
         st.write(f"Input rate: **{input_rate:,} Hz**")
         st.write(f"Output rate: **{output_rate:,} Hz**")
         st.write(f"Rational factors: **L = {up_factor}, M = {down_factor}**")
         st.write(f"Channels preserved: **{channels}**")
+        st.write(f"Input samples/channel: **{len(original):,}**")
+        st.write(f"Output samples/channel: **{len(converted):,}**")
+        st.write(f"Input duration: **{len(original) / input_rate:.6f} seconds**")
+        st.write(f"Output duration: **{len(converted) / output_rate:.6f} seconds**")
+        st.write(f"Compared samples: **{len(metrics['reference']):,}**")
         st.write("Output encoding: **16-bit PCM WAV**")
         st.write("Resampling method: **polyphase FIR (`scipy.signal.resample_poly`)**")
